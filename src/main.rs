@@ -1,12 +1,9 @@
 use futures_util::{stream::StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
-use tokio::task;
 use tokio::time;
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Waypoint {
@@ -27,6 +24,18 @@ struct StatusUpdate {
     time_remaining: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct IncomingMessage {
+    msg_type: i32,
+    timestamp_usec: i64,
+    assigned_id: Vec<String>,
+    lat_deg: Vec<f64>,
+    lon_deg: Vec<f64>,
+    alt_hae_m: Vec<f64>,
+    formation_azimuth_deg: f64,
+    intervehicle_spacing_m: f64,
+}
+
 async fn receive_navigation_params(ws_url: &str) -> NavigationParams {
     let (ws_stream, _) = connect_async(ws_url)
         .await
@@ -34,7 +43,15 @@ async fn receive_navigation_params(ws_url: &str) -> NavigationParams {
     let (_, mut read) = ws_stream.split();
 
     if let Some(Ok(Message::Text(msg))) = read.next().await {
-        return serde_json::from_str(&msg).expect("Failed to parse navigation parameters");
+        let incoming: IncomingMessage =
+            serde_json::from_str(&msg).expect("Failed to parse incoming message");
+        return NavigationParams {
+            destination: Waypoint {
+                latitude: incoming.lat_deg[0],
+                longitude: incoming.lon_deg[0],
+            },
+            speed: incoming.intervehicle_spacing_m,
+        };
     }
     panic!("Failed to receive navigation parameters");
 }
@@ -123,13 +140,26 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws_stream = accept_async(stream).await.unwrap();
-            ws_stream.send(Message::Text("{\"start\": {\"latitude\": 37.7749, \"longitude\": -122.4194}, \"destination\": {\"latitude\": 34.0522, \"longitude\": -118.2437}, \"speed\": 50.0}".to_string())).await.unwrap();
+            let test_message = r#"{
+                "msg_type": 6,
+                "timestamp_usec": 1724437355000000,
+                "assigned_id": ["cod_wap"],
+                "lat_deg": [34.124453],
+                "lon_deg": [-119.277961],
+                "alt_hae_m": [60.0],
+                "formation_azimuth_deg": 45.0,
+                "intervehicle_spacing_m": 10.0
+            }"#;
+            ws_stream
+                .send(Message::Text(test_message.to_string()))
+                .await
+                .unwrap();
         });
 
         let params = receive_navigation_params("ws://127.0.0.1:9000").await;
-        assert_eq!(params.destination.latitude, 34.0522);
-        assert_eq!(params.destination.longitude, -118.2437);
-        assert_eq!(params.speed, 50.0);
+        assert_eq!(params.destination.latitude, 34.124453);
+        assert_eq!(params.destination.longitude, -119.277961);
+        assert_eq!(params.speed, 10.0);
 
         server_task.await.unwrap();
     }
