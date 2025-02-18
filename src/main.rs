@@ -18,13 +18,6 @@ struct NavigationParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct StatusUpdate {
-    current_position: Waypoint,
-    speed: f64,
-    time_remaining: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 struct IncomingMessage {
     msg_type: i32,
     timestamp_usec: i64,
@@ -34,6 +27,34 @@ struct IncomingMessage {
     alt_hae_m: Vec<f64>,
     formation_azimuth_deg: f64,
     intervehicle_spacing_m: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct StatusUpdate {
+    msg_type: i32,
+    timestamp_usec: i64,
+    src_id: String,
+    group_id: Vec<String>,
+    lat_deg: f64,
+    lon_deg: f64,
+    alt_hae_m: f64,
+    heading_deg: f64,
+    groundspeed_mps: f64,
+    cam_azimuth_deg: f64,
+    state_of_control: i32,
+    mission_phase: i32,
+    phase_loc: PhaseLocation,
+    cam_yaw_deg: f64,
+    cam_roll_deg: f64,
+    cam_pitch_deg: f64,
+    cam_hfov: f64,
+    cam_vfov: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PhaseLocation {
+    r#type: String,
+    coordinates: Vec<Vec<[f64; 2]>>,
 }
 
 async fn receive_navigation_params(ws_url: &str) -> NavigationParams {
@@ -91,10 +112,33 @@ async fn start_navigation(start: Waypoint, params: NavigationParams, status_ws_u
         current_position.longitude =
             start.longitude + progress * (params.destination.longitude - start.longitude);
 
+        // let status = StatusUpdate {
+        //     current_position: current_position.clone(),
+        //     speed: params.speed,
+        //     time_remaining: total_time - time_elapsed,
+        // };
         let status = StatusUpdate {
-            current_position: current_position.clone(),
-            speed: params.speed,
-            time_remaining: total_time - time_elapsed,
+            msg_type: 3,
+            timestamp_usec: 1724437355000000,
+            src_id: "cod_wap".to_string(),
+            group_id: vec!["group_5".to_string()],
+            lat_deg: current_position.latitude,
+            lon_deg: current_position.longitude,
+            alt_hae_m: 0.0,
+            heading_deg: 0.0,
+            groundspeed_mps: params.speed,
+            cam_azimuth_deg: 0.0,
+            state_of_control: 0,
+            mission_phase: 2,
+            phase_loc: PhaseLocation {
+                r#type: "Polygon".to_string(),
+                coordinates: vec![],
+            },
+            cam_yaw_deg: 0.0,
+            cam_roll_deg: 0.0,
+            cam_pitch_deg: 0.0,
+            cam_hfov: 0.0,
+            cam_vfov: 0.0,
         };
 
         let msg = serde_json::to_string(&status).expect("Failed to serialize status update");
@@ -179,9 +223,8 @@ mod tests {
                     .flatten()
             {
                 let status: StatusUpdate = serde_json::from_str(&msg).unwrap();
-                assert!(status.current_position.latitude > 37.0);
-                assert!(status.current_position.longitude < -118.0);
-                assert!(status.time_remaining >= 0.0);
+                assert!(status.lat_deg > 37.0);
+                assert!(status.lon_deg < -118.0);
 
                 received_messages += 1;
                 if received_messages >= 5 {
