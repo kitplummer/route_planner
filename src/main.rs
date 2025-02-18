@@ -1,169 +1,171 @@
-use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::time::sleep;
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message, WebSocketStream};
-use url::Url;
+use tokio::task;
+use tokio::time;
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::protocol::Message};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Waypoint {
     latitude: f64,
     longitude: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RouteCommand {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct NavigationParams {
+    start: Waypoint,
     destination: Waypoint,
     speed: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RouteUpdate {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct StatusUpdate {
     current_position: Waypoint,
-    remaining_distance: f64,
-    estimated_time: f64,
+    speed: f64,
+    time_remaining: f64,
 }
 
-struct RoutePlanner {
-    c2_socket: Option<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-    agent_socket: Option<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-}
-impl RoutePlanner {
-    async fn new(c2_url: &str, agent_url: &str) -> Result<Self> {
-        println!("Planner: Waiting before attempting to connect...");
-        sleep(Duration::from_secs(2)).await;
+async fn receive_navigation_params(ws_url: &str) -> NavigationParams {
+    let (ws_stream, _) = connect_async(ws_url)
+        .await
+        .expect("Failed to connect to WebSocket server");
+    let (_, mut read) = ws_stream.split();
 
-        println!("Planner: Connecting to C2 and Agent WebSocket servers");
-        let (c2_socket, _) = connect_async(Url::parse(c2_url)?).await?;
-        let (agent_socket, _) = connect_async(Url::parse(agent_url)?).await?;
-        println!("Planner: Successfully connected to WebSocket servers");
-        Ok(Self {
-            c2_socket: Some(c2_socket),
-            agent_socket: Some(agent_socket),
-        })
+    if let Some(Ok(Message::Text(msg))) = read.next().await {
+        return serde_json::from_str(&msg).expect("Failed to parse navigation parameters");
     }
+    panic!("Failed to receive navigation parameters");
+}
 
-    async fn run(&mut self) -> Result<()> {
-        println!("Planner: Entering message loop");
-        while let Some(socket) = self.c2_socket.as_mut() {
-            if let Some(msg) = socket.next().await {
-                let msg = msg?;
-                match msg {
-                    Message::Text(text) => {
-                        let command: RouteCommand = serde_json::from_str(&text)?;
-                        let update = RouteUpdate {
-                            current_position: Waypoint {
-                                latitude: 0.0,
-                                longitude: 0.0,
-                            },
-                            remaining_distance: 100.0,
-                            estimated_time: 100.0 / command.speed,
-                        };
-                        let update_json = serde_json::to_string(&update)?;
-                        if let Some(agent) = self.agent_socket.as_mut() {
-                            match agent.send(Message::Text(update_json)).await {
-                                Ok(_) => println!("Planner successfully sent update"),
-                                Err(e) => {
-                                    println!("Planner: Warning - Failed to send update: {}", e)
-                                }
-                            }
-                        }
-                    }
-                    Message::Close(_) => {
-                        println!(
-                            "Planner: Received close from C2, ensuring Agent is closed first..."
-                        );
-                        if let Some(mut agent) = self.agent_socket.take() {
-                            if agent.close(None).await.is_err() {
-                                println!("Planner: Warning - Agent was already closed");
-                            } else {
-                                println!("Planner: Successfully closed Agent connection");
-                            }
-                        }
-                        if let Some(mut c2) = self.c2_socket.take() {
-                            if c2.close(None).await.is_err() {
-                                println!("Planner: Warning - C2 was already closed");
-                            } else {
-                                println!("Planner: Successfully closed C2 connection");
-                            }
-                        }
-                        println!("Planner: WebSocket shutdown completed");
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
+fn haversine_distance(start: &Waypoint, end: &Waypoint) -> f64 {
+    let r = 6371e3;
+    let lat1 = start.latitude.to_radians();
+    let lat2 = end.latitude.to_radians();
+    let delta_lat = (end.latitude - start.latitude).to_radians();
+    let delta_lon = (end.longitude - start.longitude).to_radians();
+    let a =
+        (delta_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    r * c
+}
+
+async fn start_navigation(params: NavigationParams, status_ws_url: &str) {
+    let (ws_stream, _) = match connect_async(status_ws_url).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("Failed to connect to WebSocket server: {:?}", e);
+            return;
         }
-        Ok(())
+    };
+    let (mut write, _) = ws_stream.split();
+
+    let total_distance = haversine_distance(&params.start, &params.destination);
+    let total_time = total_distance / params.speed;
+    let start_time = Instant::now();
+
+    let mut current_position = params.start.clone();
+    let mut time_elapsed = 0.0;
+
+    while time_elapsed < total_time {
+        time::sleep(Duration::from_secs(1)).await;
+        time_elapsed = start_time.elapsed().as_secs_f64();
+
+        let progress = time_elapsed / total_time;
+        current_position.latitude = params.start.latitude
+            + progress * (params.destination.latitude - params.start.latitude);
+        current_position.longitude = params.start.longitude
+            + progress * (params.destination.longitude - params.start.longitude);
+
+        let status = StatusUpdate {
+            current_position: current_position.clone(),
+            speed: params.speed,
+            time_remaining: total_time - time_elapsed,
+        };
+
+        let msg = serde_json::to_string(&status).expect("Failed to serialize status update");
+        if let Err(e) = write.send(Message::Text(msg)).await {
+            eprintln!("Failed to send status update: {:?}, stopping updates.", e);
+            break; // Stop sending if the connection is broken
+        }
     }
+}
+
+#[tokio::main]
+async fn main() {
+    let ws_receive_url = "ws://localhost:9000/receive";
+    let ws_send_url = "ws://localhost:9001/send";
+
+    let params = receive_navigation_params(ws_receive_url).await;
+    start_navigation(params, ws_send_url).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
-    async fn setup_test_server(port: u16) -> Result<TcpListener> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-        println!("Test server listening on port {}", port);
-        Ok(listener)
+    #[tokio::test]
+    async fn test_websocket_connection() {
+        let listener = TcpListener::bind("127.0.0.1:9000").await.unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws_stream = accept_async(stream).await.unwrap();
+            ws_stream.send(Message::Text("{\"start\": {\"latitude\": 37.7749, \"longitude\": -122.4194}, \"destination\": {\"latitude\": 34.0522, \"longitude\": -118.2437}, \"speed\": 50.0}".to_string())).await.unwrap();
+        });
+
+        let params = receive_navigation_params("ws://127.0.0.1:9000").await;
+        assert_eq!(params.start.latitude, 37.7749);
+        assert_eq!(params.start.longitude, -122.4194);
+        assert_eq!(params.destination.latitude, 34.0522);
+        assert_eq!(params.destination.longitude, -118.2437);
+        assert_eq!(params.speed, 50.0);
+
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn test_route_planning() -> Result<()> {
-        let c2_listener = setup_test_server(8081).await?;
-        let agent_listener = setup_test_server(8082).await?;
+    async fn test_navigation_updates() {
+        let listener = TcpListener::bind("127.0.0.1:9001").await.unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws_stream = accept_async(stream).await.unwrap();
 
-        let c2_handle = tokio::spawn(async move {
-            let (socket, _) = c2_listener.accept().await?;
-            let mut ws_stream = accept_async(socket).await?;
-            println!("C2 server successfully accepted WebSocket connection");
-            ws_stream
-                .send(Message::Text(
-                    "{\"destination\": {\"latitude\": 1.0, \"longitude\": 1.0}, \"speed\": 50.0}"
-                        .to_string(),
-                ))
-                .await?;
-            ws_stream.flush().await?;
-            ws_stream.send(Message::Close(None)).await?;
-            ws_stream.flush().await?;
-            Ok::<_, anyhow::Error>(())
-        });
+            let mut received_messages = 0;
+            while let Some(Ok(Message::Text(msg))) =
+                time::timeout(Duration::from_secs(10), ws_stream.next())
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                let status: StatusUpdate = serde_json::from_str(&msg).unwrap();
+                assert!(status.current_position.latitude > 37.0);
+                assert!(status.current_position.longitude < -118.0);
+                assert!(status.time_remaining >= 0.0);
 
-        let agent_handle = tokio::spawn(async move {
-            let (socket, _) = agent_listener.accept().await?;
-            let mut ws_stream = accept_async(socket).await?;
-            println!("Agent server successfully accepted WebSocket connection");
-            while let Some(msg) = ws_stream.next().await {
-                match msg? {
-                    Message::Text(text) => {
-                        println!("Agent received update: {}", text);
-                    }
-                    Message::Close(_) => {
-                        println!("Agent: Closing connection");
-                        ws_stream.close(None).await.ok();
-                        break;
-                    }
-                    _ => {}
+                received_messages += 1;
+                if received_messages >= 5 {
+                    // Stop after receiving a few updates
+                    break;
                 }
             }
-            Ok::<_, anyhow::Error>(())
         });
 
-        let planner_handle = tokio::spawn(async move {
-            let mut planner =
-                RoutePlanner::new("ws://localhost:8081", "ws://localhost:8082").await?;
-            planner.run().await
-        });
-
-        let results = tokio::join!(c2_handle, agent_handle, planner_handle);
-        results.0??;
-        results.1??;
-        results.2??;
-
-        Ok(())
+        let params = NavigationParams {
+            start: Waypoint {
+                latitude: 37.7749,
+                longitude: -122.4194,
+            },
+            destination: Waypoint {
+                latitude: 34.0522,
+                longitude: -118.2437,
+            },
+            speed: 50.0,
+        };
+        start_navigation(params, "ws://127.0.0.1:9001").await;
+        server_task.await.unwrap();
     }
 }
