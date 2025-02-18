@@ -1,5 +1,6 @@
 use futures_util::{stream::StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -15,7 +16,6 @@ struct Waypoint {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct NavigationParams {
-    start: Waypoint,
     destination: Waypoint,
     speed: f64,
 }
@@ -51,21 +51,17 @@ fn haversine_distance(start: &Waypoint, end: &Waypoint) -> f64 {
     r * c
 }
 
-async fn start_navigation(params: NavigationParams, status_ws_url: &str) {
-    let (ws_stream, _) = match connect_async(status_ws_url).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("Failed to connect to WebSocket server: {:?}", e);
-            return;
-        }
-    };
+async fn start_navigation(start: Waypoint, params: NavigationParams, status_ws_url: &str) {
+    let (ws_stream, _) = connect_async(status_ws_url)
+        .await
+        .expect("Failed to connect to WebSocket server");
     let (mut write, _) = ws_stream.split();
 
-    let total_distance = haversine_distance(&params.start, &params.destination);
+    let total_distance = haversine_distance(&start, &params.destination);
     let total_time = total_distance / params.speed;
     let start_time = Instant::now();
 
-    let mut current_position = params.start.clone();
+    let mut current_position = start.clone();
     let mut time_elapsed = 0.0;
 
     while time_elapsed < total_time {
@@ -73,10 +69,10 @@ async fn start_navigation(params: NavigationParams, status_ws_url: &str) {
         time_elapsed = start_time.elapsed().as_secs_f64();
 
         let progress = time_elapsed / total_time;
-        current_position.latitude = params.start.latitude
-            + progress * (params.destination.latitude - params.start.latitude);
-        current_position.longitude = params.start.longitude
-            + progress * (params.destination.longitude - params.start.longitude);
+        current_position.latitude =
+            start.latitude + progress * (params.destination.latitude - start.latitude);
+        current_position.longitude =
+            start.longitude + progress * (params.destination.longitude - start.longitude);
 
         let status = StatusUpdate {
             current_position: current_position.clone(),
@@ -87,18 +83,31 @@ async fn start_navigation(params: NavigationParams, status_ws_url: &str) {
         let msg = serde_json::to_string(&status).expect("Failed to serialize status update");
         if let Err(e) = write.send(Message::Text(msg)).await {
             eprintln!("Failed to send status update: {:?}, stopping updates.", e);
-            break; // Stop sending if the connection is broken
+            break;
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: {} <start_latitude> <start_longitude>", args[0]);
+        return;
+    }
+
+    let start_latitude: f64 = args[1].parse().expect("Invalid latitude");
+    let start_longitude: f64 = args[2].parse().expect("Invalid longitude");
+    let start = Waypoint {
+        latitude: start_latitude,
+        longitude: start_longitude,
+    };
+
     let ws_receive_url = "ws://localhost:9000/receive";
     let ws_send_url = "ws://localhost:9001/send";
 
     let params = receive_navigation_params(ws_receive_url).await;
-    start_navigation(params, ws_send_url).await;
+    start_navigation(start, params, ws_send_url).await;
 }
 
 #[cfg(test)]
@@ -118,8 +127,6 @@ mod tests {
         });
 
         let params = receive_navigation_params("ws://127.0.0.1:9000").await;
-        assert_eq!(params.start.latitude, 37.7749);
-        assert_eq!(params.start.longitude, -122.4194);
         assert_eq!(params.destination.latitude, 34.0522);
         assert_eq!(params.destination.longitude, -118.2437);
         assert_eq!(params.speed, 50.0);
@@ -155,17 +162,17 @@ mod tests {
         });
 
         let params = NavigationParams {
-            start: Waypoint {
-                latitude: 37.7749,
-                longitude: -122.4194,
-            },
             destination: Waypoint {
                 latitude: 34.0522,
                 longitude: -118.2437,
             },
             speed: 50.0,
         };
-        start_navigation(params, "ws://127.0.0.1:9001").await;
+        let start = Waypoint {
+            latitude: 37.7749,
+            longitude: -122.4194,
+        };
+        start_navigation(start, params, "ws://127.0.0.1:9001").await;
         server_task.await.unwrap();
     }
 }
