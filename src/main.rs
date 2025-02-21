@@ -60,6 +60,18 @@ struct PhaseLocation {
     coordinates: Vec<Vec<[f64; 2]>>,
 }
 
+fn haversine_distance(start: &Waypoint, end: &Waypoint) -> f64 {
+    let r = 6371e3;
+    let lat1 = start.latitude.to_radians();
+    let lat2 = end.latitude.to_radians();
+    let delta_lat = (end.latitude - start.latitude).to_radians();
+    let delta_lon = (end.longitude - start.longitude).to_radians();
+    let a =
+        (delta_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    r * c
+}
+
 async fn handle_websocket(api_url: &str, start: Waypoint) {
     let (ws_stream, _) = connect_async(api_url).await.expect("Failed to connect to WebSocket server");
     let (mut write, mut read) = ws_stream.split();
@@ -125,16 +137,16 @@ async fn handle_websocket(api_url: &str, start: Waypoint) {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <start_latitude> <start_longitude>", args[0]);
+    if args.len() < 4 {
+        eprintln!("Usage: {} <start_latitude> <start_longitude> <websocket_url>", args[0]);
         return;
     }
 
     let start_latitude: f64 = args[1].parse().expect("Invalid latitude");
     let start_longitude: f64 = args[2].parse().expect("Invalid longitude");
+    let websocket_url = &args[3];
     let start = Waypoint { latitude: start_latitude, longitude: start_longitude };
 
-    let api_url = "ws://localhost:9000/api/c2";
-    handle_websocket(api_url, start).await;
+    handle_websocket(websocket_url, start).await;
 }
 
